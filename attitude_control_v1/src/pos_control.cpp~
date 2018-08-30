@@ -1,0 +1,472 @@
+#include "ros/ros.h"
+#include "std_msgs/String.h"
+#include "geometry_msgs/Quaternion.h"
+#include "geometry_msgs/Vector3.h"
+#include "geometry_msgs/Twist.h"
+#include "sensor_msgs/Image.h"
+#include "sensor_msgs/Imu.h"
+#include "mavros_msgs/AttitudeTarget.h"
+#include "math.h"
+#include "tf/transform_datatypes.h"
+#include "aruco_msgs/MarkerArray.h"
+#include <px_comm/OpticalFlow.h>
+
+double freq = 1000;
+
+ros::Publisher pub;//使ってない
+/*current_position*/
+float marker_pos_x;
+float marker_pos_y;
+float marker_t;//マーカで位置を得る計算周期
+float imu_pos_x;
+float imu_pos_y;
+float imu_t;//imuで位置を得る計算周期
+double current_roll;
+double current_pitch;
+double current_yaw;
+/*positionの微分*/
+float diff_x[2];
+float diff_y[2];
+/*positionの積分*/
+double integral_x, integral_y;
+/*markerによる現在のオイラー角のヨー*/
+double marker_current_euler_yaw;
+/*自己位置検出時間*/
+/*連続して1s以内で検出すればmarkerのposを使う*/
+ros::Time marker_1stTime;//周期的でないことに注意
+ros::Time marker_2ndTime;
+ros::Time marker_timer1;
+ros::Time marker_timer2;
+double wait_time;
+double marker_del_t;
+double del_t;//DELTA T
+/*attitudeの指令値*/
+mavros_msgs::AttitudeTarget guide_msg;//mavrosにpublishする姿勢
+/*markerを検出しているかのフラグ*/
+int marker_succeeded;
+int next_target = 0;
+int i = 0;
+int marker_num = 0;
+/*globalに定義する変数*/
+/*target*/
+float target_pos_x[5], target_pos_y[5], target_pos_z[5];///////////////////
+/*current*/
+float curr_pos_x, curr_pos_y, curr_pos_z;
+/*markerから計算した速度*/
+double marker_x_position_dot, marker_y_position_dot;
+
+/*******************************関数定義*********************************
+ *Subscribeする対象のトピックが更新されたら呼び出されるコールバック関数(Cb)
+ *引数にはトピックにPublishされるメッセージの型と同じ型を定義すること
+ ***********************************************************************/
+/**
+ * @brief RPYからクオータニオンを取得する関数
+ *
+ * @param roll [rad]
+ * @param pitch [rad]
+ * @param yaw [rad]
+ * @param[out] q クオータニオン
+ */
+void GetQuaternionMsg(
+    double roll,double pitch,double yaw,
+    geometry_msgs::Quaternion &q){
+  tf::Quaternion quat=tf::createQuaternionFromRPY(roll,pitch,yaw);
+  quaternionTFToMsg(quat,q);
+}
+
+/**
+ *  @brief ROSのトピックのクオータニオンの構造体から
+ *         Roll,Pitch,Yaw角を取得する関数
+ *  @param q トピックのクオータニオン
+ *  @param[out] roll [rad]
+ *  @param[out] pitch [rad]
+ *  @param[out] yaw [rad]
+ */
+void GetRPY(const geometry_msgs::Quaternion &q,
+    double &roll,double &pitch,double &yaw){
+  tf::Quaternion quat(q.x,q.y,q.z,q.w);
+  tf::Matrix3x3(quat).getRPY(roll, pitch, yaw);
+}
+/*======================================================================
+  markerを検出したとき現在位置からmarkerごとの目標位置へ移動するpositionを
+  出力
+ =======================================================================*/
+void marker_Callback(const aruco_msgs::MarkerArray::Ptr& msg){
+  int id;
+  float curr_quat_x, curr_quat_y, curr_quat_z, curr_quat_w;
+  float curr_eul_x, curr_eul_y, curr_eul_z;
+  /*自己位置取得周期をグローバル変数に格納*/
+  marker_2ndTime = marker_1stTime;
+  marker_1stTime = ros::Time::now();
+  /*marker検出時間計測開始*/
+  marker_timer1 = ros::Time::now();
+  /**/
+  ros::Time target_location_latency_timer;
+  ros::Time target_location_latency_start;
+  ros::Time target_location_latency_now;
+  ros::Duration target_location_latency;
+  /*初期化*/
+  ros::NodeHandle n;
+  //MarkerIDの値をidに格納する
+  id = msg->markers[0].id;
+  //MarkerPositionの値をpos_x,pos_y,pos_zに格納する
+  curr_pos_x = msg->markers[0].pose.pose.position.x;
+  curr_pos_y = msg->markers[0].pose.pose.position.y;
+  curr_pos_z = msg->markers[0].pose.pose.position.z;
+  //MarkerPoseQuaternionの値をquaternionのx,y,zに格納する
+  curr_quat_x = msg->markers[0].pose.pose.orientation.x;
+  curr_quat_y = msg->markers[0].pose.pose.orientation.y;
+  curr_quat_z = msg->markers[0].pose.pose.orientation.z;
+  curr_quat_w = msg->markers[0].pose.pose.orientation.w;
+  
+  /*Quaternion -> Euler Start */
+  geometry_msgs::Quaternion marker_quaternion_Msg;
+  marker_quaternion_Msg.x = curr_quat_x;
+  marker_quaternion_Msg.y = curr_quat_y;
+  marker_quaternion_Msg.z = curr_quat_z;
+  marker_quaternion_Msg.w = curr_quat_w;
+  double marker_current_eular_roll, marker_current_eular_pitch, marker_current_euler_yaw;
+  GetRPY(marker_quaternion_Msg, marker_current_eular_roll, marker_current_eular_pitch, marker_current_euler_yaw);
+  ROS_INFO("marker_roll:%f, marker_pitch:%f, marker_yaw:%f", marker_current_eular_roll, marker_current_eular_pitch, marker_current_euler_yaw);
+  /*Quaternion -> Euler End*/
+  
+  std::cout << "-----------------------------------" << std::endl;
+  //MarkerIDの表示
+  std::cout << "Marker        ID: " << id << std::endl;
+  //MarkerPositionの表示
+  std::cout << "MarkerPosition x: " << curr_pos_x << std::endl;
+  std::cout << "               y: " << curr_pos_y << std::endl;
+  std::cout << "               z: " << curr_pos_z << std::endl;
+  std::cout << "             yaw: " << curr_eul_z << std::endl << std::endl;
+  /*idによって処理を変更する*/
+  if(id == 1000){
+    /*target positionの指定*/
+    target_pos_x[0] =  0.0;
+    target_pos_y[0] =  0.0;
+    target_pos_x[1] =  0.4;
+    target_pos_y[1] =  0.4;
+    target_pos_x[2] = -0.4;
+    target_pos_y[2] =  0.4;
+    target_pos_x[3] = -0.4;
+    target_pos_y[3] = -0.4;
+    target_pos_x[4] =  0.4;
+    target_pos_y[4] = -0.4;
+    /*increase marker_num*/
+    
+    if(abs(curr_pos_x - target_pos_x[marker_num]) < 0.4 && abs(curr_pos_y - target_pos_y[marker_num]) < 0.4){//0.4x0.4m以内なら
+      target_location_latency_now = ros::Time::now();
+      ros::Duration target_location_latency = target_location_latency_now - target_location_latency_start;
+      ROS_INFO("INSIDE");
+      if(target_location_latency > ros::Duration(0.1)){//0.1sec以上枠内にいれば
+	marker_num = marker_num + 1;//ターゲットpositionのカウントを上げる
+	ROS_INFO("marker_num:%d",marker_num);
+      }
+    }else{
+      target_location_latency_start = ros::Time::now();
+      ROS_INFO("OUTSIDE");
+    }
+    
+    ROS_INFO("target_pos_x:%f target_pos_y:%f", target_pos_x[marker_num], target_pos_y[marker_num]);
+    ROS_INFO("curent_pos_x:%f current_pos_y:%f", curr_pos_x, curr_pos_y);
+  }
+  /*~~~~~~~~~~marker検出周期の取得~~~~~~~~~~~~~~~~~~~~~~~~*/
+  ros::Duration dura1(marker_1stTime - marker_2ndTime);//ros::Time同士の差はros::Duration型
+  marker_del_t = dura1.toSec();
+  //ROS_INFO("marker_del_t: [%lf]\n\t", marker_del_t);
+  /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+  /*~~~~~~~~~~~制御のためのposition_errorの微積~~~~~~~~~~~*/
+  diff_x[0] = diff_x[1];
+  diff_x[1] = target_pos_x[marker_num] - curr_pos_x;
+  integral_x += diff_x[1] * del_t;
+  
+  diff_y[0] = diff_y[1];
+  diff_y[1] = target_pos_y[marker_num] - curr_pos_y;
+  integral_y += diff_y[1] * del_t;
+  /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+  /*~~~~~~~~~~~~~~~~~~~velocityの導出~~~~~~~~~~~~~~~~~~~~*/
+  marker_x_position_dot = (diff_x[1] - diff_x[0]) / del_t;
+  marker_y_position_dot = (diff_y[1] - diff_y[0]) / del_t;
+  /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+}
+/*======================================================================
+ * mavrosからangle&angvel&accelを受け取り現在位置が不明な場合は停止する姿勢
+ * 指令値を出力
+ *=======================================================================*/
+void imu_data_Callback(const sensor_msgs::Imu::ConstPtr& msg){
+  float quat_x, quat_y, quat_z, quat_w;
+  double imu_roll, imu_pitch, imu_yaw;
+  float angvel_x, angvel_y, angvel_z;
+  float accel_x, accel_y, accel_z;
+  mavros_msgs::AttitudeTarget msgxx;
+  ros::NodeHandle n;
+  quat_x = msg->orientation.x;
+  quat_y = msg->orientation.y;
+  quat_z = msg->orientation.z;
+  quat_w = msg->orientation.w;
+  //angular_velosityの値をangvelx,angvely,angvelzに格納する
+  angvel_x = msg->angular_velocity.x;
+  angvel_y = msg->angular_velocity.y;
+  angvel_z = msg->angular_velocity.z;
+  //linear_accelerationの値をaccelx,accely,accelzに格納する
+  accel_x = msg->linear_acceleration.x;
+  accel_y = msg->linear_acceleration.y;
+  accel_z = msg->linear_acceleration.z;
+  //処理
+  msgxx.orientation.x = 0.0;
+  msgxx.orientation.y = 0.0;
+  msgxx.orientation.z = 0.0;
+  msgxx.orientation.w = 0.0;
+  msgxx.body_rate.x = 0.0;
+  msgxx.body_rate.y = 0.0;
+  msgxx.body_rate.z = 0.0;
+  msgxx.thrust = 1.0;
+  
+  /*クォータニオンをオイラー角に変換*/
+  /*ただしNED座標系*/
+  geometry_msgs::Quaternion imu_quat_Msg;
+  imu_quat_Msg.x = quat_x;
+  imu_quat_Msg.y = quat_y;
+  imu_quat_Msg.z = quat_z;
+  imu_quat_Msg.w = quat_w;
+  double get_roll_rad, get_pitch_rad, get_yaw_rad;//Radian
+  GetRPY(imu_quat_Msg, get_roll_rad, get_pitch_rad, get_yaw_rad);
+  get_roll_rad  = get_roll_rad;
+  get_pitch_rad = get_pitch_rad;//NEDの定義に合わせて向きを変えている
+  get_yaw_rad   = get_yaw_rad;//NEDの定義に合わせて向きを変えている
+  double get_roll_deg, get_pitch_deg, get_yaw_deg;//Degree
+  get_roll_deg  = get_roll_rad  * 180/M_PI;
+  get_pitch_deg = get_pitch_rad * 180/M_PI;
+  get_yaw_deg   = get_yaw_rad   * 180/M_PI;
+  /*現在姿勢角をグローバル変数に格納*/
+  current_roll  = get_roll_rad;
+  current_pitch = get_pitch_rad;
+  current_yaw   = get_yaw_rad;
+  //ROS_INFO("roll: [%f] pitch: [%f] yaw: [%f]", current_roll, current_pitch, current_yaw);  
+  /*debag用ここから*/
+  geometry_msgs::Quaternion debug_quat_Msg;
+  GetQuaternionMsg(current_roll, current_pitch, current_yaw, debug_quat_Msg);
+  float x,y,z,w;
+  if(0  <=  get_yaw_deg){
+    x = -debug_quat_Msg.x;
+    y = -debug_quat_Msg.y;
+    z = -debug_quat_Msg.z;
+    w = -debug_quat_Msg.w;
+  }else if(0 > get_yaw_deg && get_yaw_deg > -90){
+    x = -debug_quat_Msg.x;
+    y = -debug_quat_Msg.y;
+    z = -debug_quat_Msg.z;
+    w = -debug_quat_Msg.w;
+  }else{
+    x = debug_quat_Msg.x;
+    y = debug_quat_Msg.y;
+    z = debug_quat_Msg.z;
+    w = debug_quat_Msg.w;
+  }
+  
+  //ROS_INFO("quat_x: [%f] quat_y: [%f] quat_z: [%f] quat_w:[%f]", quat_x, quat_y, quat_z, quat_w); 
+  //ROS_INFO("x: [%f] y: [%f] z: [%f] w:[%f]\n", x, y, z, w); 
+
+  /*debag用ここまで*/
+
+  //debug用printf
+  //ROS_INFO("roll_c: [%f] pitch_c: [%f] yaw: [%f]\n", imu_roll, imu_pitch, imu_yaw);
+}
+/*======================================================================
+ *Optical flow data
+ * 
+ *=======================================================================*/
+void optical_flow_Callback(const sensor_msgs::Imu::ConstPtr& msg){
+  
+  }
+/***************************関数定義はここまで****************************/
+
+int main(int argc,char **argv){
+  int cnt=0;
+  /*del_tの初期化(はじめはmarkerなし)*/
+  del_t = 1.0;
+  /*ROSの初期化*/
+  ros::init(argc, argv, "attitude_control_v1");
+  /*ノードの初期化とリソースのクリア*/
+  ros::NodeHandle n;
+
+  ros::Publisher guide_pub = n.advertise<mavros_msgs::AttitudeTarget>("mavros/setpoint_raw/attitude",100);
+  /*実行周期の定義*/
+  ros::Rate loop_rate(freq);
+  /*複数のスレッドからコールバックを呼び出すspinnerの定義*/
+  ros::AsyncSpinner spinner(5);
+
+  /*-------------generated/target_attitudeとしてpublishする--------------*/////////////
+  /*ros::NodeHandle tar_n;
+  ros::Publisher target_attitude_pub = tar_n.advertise<mavros_msgs::AttitudeTarget>("/generated/target_attitude",10);
+  mavros_msgs::AttitudeTarget target_attitude_msg;*/
+  
+  /*/mavros/setpoint_raw/attitudeの初期化*/
+  guide_msg.orientation.x = 0.0;
+  guide_msg.orientation.y = 0.0;
+  guide_msg.orientation.z = 0.0;
+  guide_msg.orientation.w = 1.0;
+  guide_msg.body_rate.x = 0.0;
+  guide_msg.body_rate.y = 0.0;
+  guide_msg.body_rate.z = 0.0;
+  guide_msg.thrust = 0.5;
+  /*target_positionの切り替え*/
+  int next_point = 0;
+  /*変数宣言*/
+  /*目標姿勢導出ゲイン*/
+  double p = 1.0;//0.09->0.5->0.035
+  double i = 0.0;
+  double d = 0.0;//0.04
+  /*姿勢コントローラゲイン*/
+  double k_rp = 0.04;
+  double k_ri = 0.0;
+  double k_rd = 0.0;
+  
+  double k_pp = 0.05;
+  double k_pi = 0.0;
+  double k_pd = 0.0;
+  
+  double k_yp = 0.8;
+  double k_yi = 0.0;
+  double k_yd = 0.0;
+  double roll;
+  double pitch;
+  double yaw;
+  double theta_d;
+  double phi_d;
+  double yaw_d;
+  double r_ang_diff[2];
+  double r_ang_integral = 0.0;
+  double p_ang_diff[2];
+  double p_ang_integral = 0.0;
+  double y_ang_diff[2];
+  double y_ang_integral = 0.0;
+
+  ros::NodeHandle node_private("~");
+  node_private.getParam("k_rp"  , k_rp );
+  node_private.getParam("k_ri"  , k_ri );
+  node_private.getParam("k_rd"  , k_rd );
+  node_private.getParam("k_pp"  , k_pp );
+  node_private.getParam("k_pi"  , k_pi );
+  node_private.getParam("k_pd"  , k_pd );
+  node_private.getParam("k_yp"  , k_yp );
+  node_private.getParam("k_yi"  , k_yi );
+  node_private.getParam("k_yd"  , k_yd );
+  
+  ros::Subscriber marker_sub = n.subscribe("/aruco_marker_publisher/markers", 100, marker_Callback);   
+  ros::Subscriber imu_sub = n.subscribe("/mavros/imu/data", 100, imu_data_Callback);
+  /*実ループ*/
+  while(ros::ok()){
+    /*delta_tの取得*/
+    del_t = marker_del_t;
+    /*位置が情報できるまでの待ち時間計算*/
+    marker_timer2 = ros::Time::now();
+    ros::Duration dura2(marker_timer2 - marker_timer1);
+    wait_time = dura2.toSec();
+    /*marker検出時間が制御に耐えられるものなら使う*/
+    /*判定条件は次のmarkerがXsecの間に検出できる時間*/
+    if(ros::Duration(wait_time) >= ros::Duration(0.2)){
+      /*markerを見失った時の補正*/
+      roll = 0.0;
+      pitch = 0.0;
+      yaw = 0.0;
+      //ROS_INFO("no_marker");
+    }else{
+      /****************************目標姿勢角生成********************************/
+      /*roll*/
+      theta_d = k_rp * diff_x[1] + k_ri * integral_x + k_rd * ( diff_x[1] - diff_x[0]) / del_t;//ロール角の生成は逆と思われる
+      if(theta_d > 0.0174533)
+	theta_d = 0.0174533;//+1deg以上は傾けない
+      if(theta_d < -0.0174533)
+	theta_d = -0.0174533;//-1deg以上は傾けない
+     
+      /*pitch*/
+      phi_d   = k_pp * diff_y[1] + k_pi * integral_y + k_pd * ( diff_y[1] - diff_y[0]) / del_t;
+      if(phi_d > 0.0174533)
+	phi_d = 0.0174533;//+1deg以上は傾けない
+      if(phi_d < -0.0174533)
+	phi_d = -0.0174533;//-1deg以上は傾けない
+      
+      /*yaw head directionの目標方位の生成*/
+      yaw_d   = 0.0;
+
+      ROS_INFO("theta_d:%f , phi_d:%f , yaw_d:%f", theta_d, phi_d, yaw_d);
+      /**************************目標姿勢角生成はここまで************************/ 
+      /*****************************姿勢コントローラ****************************/
+      /***roll***/
+      roll  = -theta_d;
+      /***pitch***/
+      pitch = phi_d;
+      /***yaw***/
+      yaw   = yaw_d;
+      ROS_INFO("roll: [%lf]  pitch: [%lf]  yaw: [%lf]\n", roll, pitch, yaw);//debug--ここでnanになっている
+    }/*************************姿勢コントローラはここまで*************************/
+
+     /*-------------------目標姿勢角をrosbag用にpublish---------------------*/
+      /*目標姿勢をQuaternionに変換する*/
+      double target_roll, target_pitch, target_yaw;
+      target_roll = theta_d;
+      target_pitch = phi_d;
+      target_yaw = yaw_d;
+      tf::Matrix3x3 target_attitude_euler;
+      target_attitude_euler.setEulerYPR(target_yaw,target_pitch,target_roll);
+      tf::Quaternion target_attitude_q;
+      target_attitude_euler.getRotation(target_attitude_q);
+
+      /*-------------generated/target_attitudeとしてpublishする--------------*/
+      /*mavros_msgs::AttitudeTarget target_attitude_msg;
+      target_attitude_msg.orientation.x = -target_attitude_q.getX();
+      target_attitude_msg.orientation.y = -target_attitude_q.getY();
+      target_attitude_msg.orientation.z = -target_attitude_q.getZ();
+      target_attitude_msg.orientation.w = -target_attitude_q.getW();
+      target_attitude_msg.body_rate.x = 0.0;
+      target_attitude_msg.body_rate.y = 0.0;
+      target_attitude_msg.body_rate.z = 0.0;
+      target_attitude_msg.thrust = 0.5;*/
+      /*publish*/
+      //target_attitude_pub.publish(target_attitude_msg);
+      /*----------------------rosgab用のpunlishはここまで--------------------*/ 
+      /*指令姿勢角のオイラー角をpublishする*/
+      double deg_roll, deg_pitch, deg_yaw;
+      deg_roll  = roll  * 180/M_PI;
+      deg_pitch = pitch * 180/M_PI;
+      deg_yaw   = yaw   * 180/M_PI;
+      ROS_INFO("deg_roll:[%f], deg_pitch:[%f], deg_yaw:[%f]", deg_roll, deg_pitch, deg_yaw);
+      
+      //publishする機能を追加予定
+      
+      /*EulerからQuaternionに変換する*/
+      geometry_msgs::Quaternion command_quat_Msg;
+      GetQuaternionMsg(roll, pitch, yaw, command_quat_Msg);
+      if(0 < deg_yaw){
+	guide_msg.orientation.x = -command_quat_Msg.x;
+	guide_msg.orientation.y = -command_quat_Msg.y;
+	guide_msg.orientation.z = -command_quat_Msg.z;
+	guide_msg.orientation.w = -command_quat_Msg.w;
+      }else if(0 > deg_yaw && deg_yaw > -90){
+	guide_msg.orientation.x = -command_quat_Msg.x;
+	guide_msg.orientation.y = -command_quat_Msg.y;
+	guide_msg.orientation.z = -command_quat_Msg.z;
+	guide_msg.orientation.w = -command_quat_Msg.w;
+      }else{
+	guide_msg.orientation.x =  command_quat_Msg.x;
+	guide_msg.orientation.y =  command_quat_Msg.y;
+	guide_msg.orientation.z =  command_quat_Msg.z;
+	guide_msg.orientation.w =  command_quat_Msg.w;
+      }
+      
+      guide_msg.body_rate.x = 0.0;
+      guide_msg.body_rate.y = 0.0;
+      guide_msg.body_rate.z = 0.0;
+      guide_msg.thrust      = 0.5;
+
+      /*実際にpublishしているところ*/
+      guide_pub.publish(guide_msg); 
+      marker_del_t = 10.0;//markerが検出がないときは10sになる
+      spinner.start();
+      loop_rate.sleep();
+  }
+  ros::waitForShutdown();
+  return 0;
+}
+
+  

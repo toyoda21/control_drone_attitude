@@ -1,0 +1,53 @@
+<launch>
+
+    <arg name="markerSize"      default="0.17"/>    <!-- in m -->
+    <arg name="side"            default="left"/>
+    <arg name="ref_frame"       default=""/>  <!-- leave empty and the pose will be published wrt param parent_name -->
+
+    <node name="usb_cam" pkg="usb_cam" type="usb_cam_node" output="screen" >
+	<param name="video_device" value="/dev/video0" />
+	<param name="image_width" value="640" />
+	<param name="image_height" value="480" />
+	<param name="pixel_format" value="mjpeg" />
+	<param name="camera_frame_id" value="usb_cam" />
+	<param name="io_method" value="mmap"/>
+
+	<rosparam param="D">[-0.-004818, -0.102088, -0.008792, 0.004202, 0.000000]</rosparam>
+    	<rosparam param="K">[626.880783, 0.000000, 316.098986, 0.000000, 630.906442, 210.057213, 0.000000, 0.000000, 1.000000]</rosparam>
+    	<rosparam param="R">[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]</rosparam>
+    	<rosparam param="P">[622.452393, 0.000000, 318.179305, 0.000000, 0.000000, 627.531250, 207.139986, 0.000000, 0.000000, 0.000000, 1.000000, 0.000000]</rosparam>
+ </node>
+
+    <node pkg="aruco_ros" type="marker_publisher" name="aruco_marker_publisher" output="screen">
+        <remap from="/camera_info" to="/usb_cam/camera_info" />
+        <remap from="/image" to="/usb_cam/image_raw" />
+
+        <param name="image_is_rectified" value="True"/>
+        <param name="marker_size"        value="$(arg markerSize)"/>
+        <param name="reference_frame"    value="$(arg ref_frame)"/>   <!-- frame in which the marker pose will be refered -->
+        <param name="camera_frame"       value="$(arg side)_hand_camera"/>
+    </node>
+
+    <node pkg="attitude_control_v1" type="attitude_control_v1" name="attitude_control_v1" output="screen" respawn="true">
+    	<param name="k_rp"   value="0.1"/>  			       				  
+	<param name="k_ri"   value="0.0"/>
+	<param name="k_rd"   value="0.0"/>
+	<param name="k_pp"   value="0.1"/>
+	<param name="k_pi"   value="0.0"/>
+	<param name="k_pd"   value="0.0"/>
+	<param name="k_yp"   value="0.8"/>
+	<param name="k_yi"   value="0.0"/>
+	<param name="k_yd"   value="0.0"/>
+    </node>
+
+    <node pkg="image_view" type="image_view" name="image_view" output="screen">
+	<remap from="/image" to="/aruco_marker_publisher/result" />
+    </node>
+
+    <node pkg="mavros" type="mavros_node" name="mavros" output="screen" respawn="true">
+    	<param name="fcu_url" value="/dev/ttyACM0:921600" />
+
+    </node>
+
+</launch>
+
